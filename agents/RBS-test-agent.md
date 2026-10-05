@@ -1,5 +1,5 @@
 ---
-name: rbs-code-tester
+name: RBS-test-agent
 description: Use to test, debug and optimize code for the user's Rome Business School (RBS) projects, such as the R Markdown Telco churn analysis. Runs the code, fixes errors and warnings, and checks that the code actually answers every question and requirement of the assignment.
 model: inherit
 ---
