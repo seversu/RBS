@@ -37,6 +37,7 @@ library(dplyr)
 library(ggplot2)
 
 # The Excel file must be in the same folder as this .Rmd file
+stopifnot(file.exists("Telco_customer_churn.xlsx"))  # clear error if the file is missing
 d <- read_excel("Telco_customer_churn.xlsx")
 
 # Make column names easier to type (spaces become dots)
@@ -102,15 +103,15 @@ ggplot(top15, aes(x = reorder(Churn.Reason, n), y = n)) +
        x = "Reason", y = "Number of churned customers")
 ```
 
-There are 20 different reasons, which is hard to read. We group them into 6 simple categories using the words in the reason ("Other" contains reasons such as "Don't know", "Product dissatisfaction" and website/support quality).
+There are 20 different reasons, which is hard to read. We group them into 6 simple categories using the words in the reason ("Other" contains "Don't know", "Product dissatisfaction" and "Service dissatisfaction").
 
 ```{r reasons-group}
 # Group reasons by keywords
 group_reason <- function(r) {
   if (grepl("Competitor", r)) return("Competitor")
-  if (grepl("Attitude", r)) return("Attitude of staff")
-  if (grepl("price|Price|charges|Extra", r)) return("Price")
-  if (grepl("Network|speed|Limited range|Lack of", r)) return("Service / network")
+  if (grepl("Attitude|Poor expertise", r)) return("Staff / support quality")
+  if (grepl("price|Price|charges|affordable", r)) return("Price")
+  if (grepl("Network|Limited range|Lack of", r)) return("Service / network")
   if (grepl("Moved|Deceased|Long distance", r)) return("Personal reasons")
   return("Other")
 }
@@ -133,7 +134,7 @@ ggplot(group_table, aes(x = reorder(Reason.Group, Percent), y = Percent)) +
        x = "", y = "% of churned customers")
 ```
 
-**Interpretation:** The largest group of reasons is **competitors** (better offers, devices, speeds, data). Another big part is the **attitude of staff** (support person and service provider). Both are things the company can influence. Only a small share is "personal" reasons such as moving, which the company cannot control.
+**Interpretation:** The largest group of reasons is **competitors** (better offers, devices, speeds, data). Another big part is **staff and support quality** (attitude and poor expertise of support or service staff, about 20%). Both are things the company can influence. Only a small share is "personal" reasons such as moving, which the company cannot control.
 
 Does the reason depend on the contract type?
 
@@ -160,6 +161,7 @@ net <- d %>% filter(Internet.Service != "No")
 services_churn <- net %>%
   group_by(Num.Services) %>%
   summarise(Customers = n(),
+            Churned = sum(Churn == "Yes"),
             Churn.Rate = round(100 * mean(Churn == "Yes"), 1))
 services_churn
 ```
@@ -200,7 +202,13 @@ ggplot(result, aes(x = reorder(Service, Difference), y = Difference)) +
        x = "", y = "Difference in churn rate (percentage points)")
 ```
 
-Now a statistical test. We compare the churn of customers with 0-1 services versus 2 or more using a **chi-square test of independence** (null hypothesis: churn and the group are independent).
+Now statistical tests. First, a **trend test** (`prop.trend.test`) asks whether the churn rate goes down steadily as the number of services goes up.
+
+```{r services-trend}
+prop.trend.test(x = services_churn$Churned, n = services_churn$Customers)
+```
+
+Second, a simple **chi-square test of independence** comparing customers with 0-1 services versus 2 or more (null hypothesis: churn and the group are independent).
 
 ```{r services-test}
 net$Service.Group <- ifelse(net$Num.Services >= 2, "2+ services", "0-1 services")
@@ -209,7 +217,7 @@ tab
 chisq.test(tab)
 ```
 
-**Interpretation:** The security-type services (**Online Security** and **Tech Support**) are linked to a much lower churn rate (negative difference), while the two streaming services show only a small difference (about 3-4 points). The more services a customer has, the lower the churn rate (from 52% with no add-ons to 5% with all six), but the *type* matters: services that help or protect the customer (security, support, backup) are linked to much lower churn than entertainment extras. Note that this is only an association; customers who already like the company may simply buy more protection.
+**Interpretation:** The security-type services (**Online Security** and **Tech Support**) are linked to a much lower churn rate (negative difference), while the two streaming services show only a small difference (about 3-4 points). The more services a customer has, the lower the churn rate (from 52% with no add-ons to 5% with all six, and the trend test is highly significant), but the *type* matters: services that help or protect the customer (security, support, backup) are linked to much lower churn than entertainment extras. Note that this is only an association; customers who already like the company may simply buy more protection.
 
 # 5. Q3: Billing choices and churn
 
@@ -441,10 +449,16 @@ The earlier questions looked at one factor at a time, but factors are related (f
 # Security do not exist for customers without internet
 net$Tenure.Years <- net$Tenure.Months / 12
 
+# Split: 70% of customers to build the model, 30% to test it on new data
+set.seed(123)
+train_rows <- sample(nrow(net), size = round(0.7 * nrow(net)))
+train <- net[train_rows, ]
+test <- net[-train_rows, ]
+
 model <- glm(Churn ~ Contract + Tenure.Years + Monthly.Charges +
                Internet.Service + Tech.Support + Online.Security +
                Payment.Method + Senior.Citizen + Dependents,
-             data = net, family = binomial)
+             data = train, family = binomial)
 
 summary(model)
 ```
@@ -469,28 +483,28 @@ ggplot(odds, aes(x = reorder(Variable, Odds.Ratio), y = Odds.Ratio)) +
        x = "", y = "Odds ratio")
 ```
 
-A quick check of how well the model fits (accuracy on the same data; we do not claim this is a final prediction model):
+A quick check of how well the model works on the 30% of customers it has **not** seen (we do not claim this is a final prediction model):
 
 ```{r accuracy}
-pred <- ifelse(predict(model, type = "response") > 0.5, "Yes", "No")
-table(Predicted = pred, Actual = net$Churn)
-cat("Model accuracy:", round(mean(pred == net$Churn), 3), "\n")
-cat("Accuracy of always guessing 'No':", round(mean(net$Churn == "No"), 3), "\n")
+pred <- ifelse(predict(model, newdata = test, type = "response") > 0.5, "Yes", "No")
+table(Predicted = pred, Actual = test$Churn)
+cat("Test accuracy:", round(mean(pred == test$Churn), 3), "\n")
+cat("Accuracy of always guessing 'No':", round(mean(test$Churn == "No"), 3), "\n")
 ```
 
-**Interpretation:** After controlling for the other factors, the strongest links with *lower* churn are having **dependents** (odds ratio 0.22), a **two-year contract** (0.30) and a **one-year contract** (0.55). Every extra year of tenure lowers the odds by about 30%, and **Online Security** and **Tech Support** each lower them by about 35-40%. Fiber optic internet (1.64) and electronic check payment (1.49) raise the odds of churn. Being a senior is only borderline significant once the other variables are included (p = 0.054), and credit card or mailed check payment is no different from bank transfer. This shows that some effects seen earlier (such as seniors) were partly explained by other variables. Monthly charges have an odds ratio of about 1.01 per dollar, which is a small effect: it is about 1.1 for every extra $10. The model classifies about 77% of the internet customers correctly, which is better than the 68% we would get by always guessing "No".
+**Interpretation:** After controlling for the other factors, the strongest links with *lower* churn are having **dependents** (odds ratio about 0.24), a **two-year contract** (about 0.25) and a **one-year contract** (about 0.58). Every extra year of tenure lowers the odds by about 30%, and **Online Security** and **Tech Support** each lower them by about 35%. Fiber optic internet (about 2.0), electronic check payment (about 1.35) and being a senior (about 1.26) raise the odds of churn. Credit card or mailed check payment is no different from bank transfer, and monthly charges are only borderline significant (p = 0.06) once the other variables are included. This shows that part of the effects seen earlier came from other variables. The exact numbers change a little with the random split, but the main pattern is stable. On the 30% test customers the model classifies about 77% correctly, which is better than the 69% we would get by always guessing "No".
 
 # 11. Summary of main findings
 
 1. **About 1 in 4 customers churned (26.5%).**
-2. **Reasons:** The main reasons given are competitors (better offers, devices, speed) and the attitude of staff. Both are controllable by the company.
+2. **Reasons:** The main reasons given are competitors (33%, better offers, devices, speed) and staff/support quality (20%). Both are controllable by the company; personal reasons such as moving are only 3%.
 3. **Protective services:** churn falls from 52% (no add-ons) to 5% (all six add-ons). Online Security and Tech Support show the biggest gap (about 26-27 points); streaming services only show about 3-4 points.
 4. **Billing:** Electronic check payers and paperless billing customers churn more, also within the same contract type.
 5. **Customer profile:** Seniors and customers without partner or dependents are more likely to leave. Gender does not matter.
 6. **Price and product:** Churners pay more overall ($74 vs. $61) only because fiber optic customers pay more and churn more (42% vs. 19% for DSL). Within the same internet type, churners do not pay more.
 7. **Location:** Churn is spread over California without a clear regional pattern; differences between the larger cities are not significant (p = 0.73).
 8. **Business impact:** Churners represent 30.5% of monthly revenue (vs. 26.5% of customers), and about 87% of the lost revenue comes from month-to-month contracts.
-9. **Combined model:** Dependents, contract length, tenure, fiber optic internet, electronic check payment, and Online Security / Tech Support are the most important factors when considered together.
+9. **Combined model:** Dependents, contract length, tenure, fiber optic internet, electronic check payment, and Online Security / Tech Support are the most important factors when considered together. The model reaches about 77% accuracy on unseen test customers (vs. 69% for always guessing "No").
 
 ## Implications
 
@@ -505,7 +519,7 @@ cat("Accuracy of always guessing 'No':", round(mean(net$Churn == "No"), 3), "\n"
 * Would a customer who contacts tech support in the first months be more likely to stay? (We have no support-contact data.)
 * Why does fiber optic churn more: price, quality, or competitors in the area?
 * Does the effect of services change over time (tenure)?
-* A better prediction model should be tested on a separate test set (train/test split) instead of the same data.
+* Could a more flexible model (for example a decision tree) predict churn better than the logistic regression?
 
 ## Limitations
 
