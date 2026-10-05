@@ -1,0 +1,514 @@
+---
+title: "Exploratory Analysis of Customer Churn - IBM Telco Dataset"
+author: "Group name / member names here"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5)
+```
+
+# 1. Introduction
+
+Customer churn means that a customer stops using a company's service. Keeping a customer is usually cheaper than finding a new one, so it is useful to understand **who leaves and why**.
+
+In this document we explore the IBM Telco Customer Churn dataset. Our goal is to go beyond the basic analysis (churn by contract type, tenure and monthly charges) and answer our own questions:
+
+1. **Q1:** What reasons do churned customers give for leaving?
+2. **Q2:** Do customers with more add-on services churn less?
+3. **Q3:** Are billing choices (payment method, paperless billing) linked to churn?
+4. **Q4:** How do family situation and age (senior, partner, dependents) relate to churn?
+5. **Q5:** Do churned customers pay more? Does it depend on the internet service type?
+6. **Q6:** Does churn differ by location in California?
+7. **Q7:** How much value (CLTV and monthly revenue) is lost through churn?
+8. **Q8:** Which factors still matter when we look at them together (logistic regression)?
+
+# 2. Data loading and cleaning
+
+```{r load}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+
+# The Excel file must be in the same folder as this .Rmd file
+d <- read_excel("Telco_customer_churn.xlsx")
+
+# Make column names easier to type (spaces become dots)
+names(d) <- make.names(names(d))
+
+dim(d)
+```
+
+The data has 7,043 customers and 33 columns. Let us check missing values.
+
+```{r missing}
+colSums(is.na(d))[colSums(is.na(d)) > 0]
+```
+
+Two columns have missing values:
+
+* **Churn.Reason** is only filled for customers who left (5,174 customers stayed, so they have no reason). This is expected.
+* **Total.Charges** is missing for 11 customers. Let us see who they are.
+
+```{r missing2}
+d %>% filter(is.na(Total.Charges)) %>%
+  select(CustomerID, Tenure.Months, Contract, Churn.Label)
+```
+
+All 11 customers have 0 months of tenure, so they are brand-new customers who have not been billed yet. We will keep them (they have no Total Charges, which is correct).
+
+We also create a few helper variables that we will use later.
+
+```{r prep}
+# Churn as a factor, with "No" first
+d$Churn <- factor(d$Churn.Label, levels = c("No", "Yes"))
+
+# Number of add-on services each customer has (max 6)
+d$Num.Services <- (d$Online.Security == "Yes") + (d$Online.Backup == "Yes") +
+  (d$Device.Protection == "Yes") + (d$Tech.Support == "Yes") +
+  (d$Streaming.TV == "Yes") + (d$Streaming.Movies == "Yes")
+
+table(d$Churn)
+round(prop.table(table(d$Churn)) * 100, 1)
+```
+
+About **26.5%** of the customers churned. So the data is somewhat imbalanced (roughly 1 churner for every 3 non-churners).
+
+# 3. Q1: Why do customers leave?
+
+The column `Churn.Reason` gives the reason for each churned customer. There are many different reasons, so we first look at the most common ones.
+
+```{r reasons}
+reasons <- d %>%
+  filter(Churn == "Yes") %>%
+  count(Churn.Reason, sort = TRUE)
+
+head(reasons, 10)
+```
+
+```{r reasons-plot, fig.height=6}
+top15 <- head(reasons, 15)
+
+ggplot(top15, aes(x = reorder(Churn.Reason, n), y = n)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 15 reasons for churn",
+       x = "Reason", y = "Number of churned customers")
+```
+
+There are 20 different reasons, which is hard to read. We group them into 6 simple categories using the words in the reason ("Other" contains reasons such as "Don't know", "Product dissatisfaction" and website/support quality).
+
+```{r reasons-group}
+# Group reasons by keywords
+group_reason <- function(r) {
+  if (grepl("Competitor", r)) return("Competitor")
+  if (grepl("Attitude", r)) return("Attitude of staff")
+  if (grepl("price|Price|charges|Extra", r)) return("Price")
+  if (grepl("Network|speed|Limited range|Lack of", r)) return("Service / network")
+  if (grepl("Moved|Deceased|Long distance", r)) return("Personal reasons")
+  return("Other")
+}
+
+churned <- d %>% filter(Churn == "Yes")
+churned$Reason.Group <- sapply(churned$Churn.Reason, group_reason)
+
+group_table <- churned %>% count(Reason.Group, sort = TRUE) %>%
+  mutate(Percent = round(100 * n / sum(n), 1))
+group_table
+```
+
+```{r reasons-group-plot}
+ggplot(group_table, aes(x = reorder(Reason.Group, Percent), y = Percent)) +
+  geom_col(fill = "darkorange") +
+  geom_text(aes(label = paste0(Percent, "%")), hjust = -0.1) +
+  coord_flip() +
+  ylim(0, max(group_table$Percent) + 8) +
+  labs(title = "Reasons for churn, grouped",
+       x = "", y = "% of churned customers")
+```
+
+**Interpretation:** The largest group of reasons is **competitors** (better offers, devices, speeds, data). Another big part is the **attitude of staff** (support person and service provider). Both are things the company can influence. Only a small share is "personal" reasons such as moving, which the company cannot control.
+
+Does the reason depend on the contract type?
+
+```{r reasons-contract}
+table(churned$Reason.Group, churned$Contract)
+```
+
+```{r reasons-contract-plot}
+ggplot(churned, aes(x = Contract, fill = Reason.Group)) +
+  geom_bar(position = "fill") +
+  labs(title = "Churn reason group by contract type",
+       y = "Share of churned customers", fill = "Reason")
+```
+
+Most churners are on month-to-month contracts, so the other contract groups are small and their percentages should be read carefully.
+
+# 4. Q2: Do more add-on services mean less churn?
+
+We count how many of the 6 add-on services (online security, online backup, device protection, tech support, streaming TV, streaming movies) each customer has. Internet is needed for these services, so we only use customers **with internet service**.
+
+```{r services}
+net <- d %>% filter(Internet.Service != "No")
+
+services_churn <- net %>%
+  group_by(Num.Services) %>%
+  summarise(Customers = n(),
+            Churn.Rate = round(100 * mean(Churn == "Yes"), 1))
+services_churn
+```
+
+```{r services-plot}
+ggplot(services_churn, aes(x = Num.Services, y = Churn.Rate)) +
+  geom_line(color = "grey50") +
+  geom_point(aes(size = Customers), color = "firebrick") +
+  scale_x_continuous(breaks = 0:6) +
+  labs(title = "Churn rate by number of add-on services (internet customers)",
+       x = "Number of add-on services", y = "Churn rate (%)")
+```
+
+Next, we check each service separately to see which one matters most.
+
+```{r services-each}
+services <- c("Online.Security", "Online.Backup", "Device.Protection",
+              "Tech.Support", "Streaming.TV", "Streaming.Movies")
+
+# Churn rate for customers WITH and WITHOUT each service
+result <- data.frame()
+for (s in services) {
+  rates <- tapply(net$Churn == "Yes", net[[s]], mean) * 100
+  result <- rbind(result, data.frame(Service = s,
+                                     Without = round(rates["No"], 1),
+                                     With = round(rates["Yes"], 1)))
+}
+result$Difference <- result$With - result$Without
+rownames(result) <- NULL
+result
+```
+
+```{r services-each-plot}
+ggplot(result, aes(x = reorder(Service, Difference), y = Difference)) +
+  geom_col(fill = "seagreen") +
+  coord_flip() +
+  labs(title = "Churn rate difference: customers with vs. without each service",
+       x = "", y = "Difference in churn rate (percentage points)")
+```
+
+Now a statistical test. We compare the churn of customers with 0-1 services versus 2 or more using a **chi-square test of independence** (null hypothesis: churn and the group are independent).
+
+```{r services-test}
+net$Service.Group <- ifelse(net$Num.Services >= 2, "2+ services", "0-1 services")
+tab <- table(net$Service.Group, net$Churn)
+tab
+chisq.test(tab)
+```
+
+**Interpretation:** The security-type services (**Online Security** and **Tech Support**) are linked to a much lower churn rate (negative difference), while the two streaming services show only a small difference (about 3-4 points). The more services a customer has, the lower the churn rate (from 52% with no add-ons to 5% with all six), but the *type* matters: services that help or protect the customer (security, support, backup) are linked to much lower churn than entertainment extras. Note that this is only an association; customers who already like the company may simply buy more protection.
+
+# 5. Q3: Billing choices and churn
+
+```{r billing}
+pay <- d %>% group_by(Payment.Method) %>%
+  summarise(Customers = n(),
+            Churn.Rate = round(100 * mean(Churn == "Yes"), 1))
+pay
+
+paper <- d %>% group_by(Paperless.Billing) %>%
+  summarise(Customers = n(),
+            Churn.Rate = round(100 * mean(Churn == "Yes"), 1))
+paper
+```
+
+```{r billing-plot}
+ggplot(pay, aes(x = reorder(Payment.Method, Churn.Rate), y = Churn.Rate)) +
+  geom_col(fill = "purple") +
+  geom_text(aes(label = paste0(Churn.Rate, "%")), hjust = -0.1) +
+  coord_flip() +
+  ylim(0, 60) +
+  labs(title = "Churn rate by payment method", x = "", y = "Churn rate (%)")
+```
+
+Statistical tests:
+
+```{r billing-test}
+chisq.test(table(d$Payment.Method, d$Churn))
+chisq.test(table(d$Paperless.Billing, d$Churn))
+```
+
+Electronic check users churn much more than the others. Is this just because electronic check users are mostly on month-to-month contracts? We check with a **heatmap** of churn rate by payment method and contract.
+
+```{r billing-heatmap}
+heat <- d %>% group_by(Payment.Method, Contract) %>%
+  summarise(Churn.Rate = round(100 * mean(Churn == "Yes"), 1),
+            Customers = n(), .groups = "drop")
+
+ggplot(heat, aes(x = Contract, y = Payment.Method, fill = Churn.Rate)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = paste0(Churn.Rate, "%\n(n=", Customers, ")"))) +
+  scale_fill_gradient(low = "lightyellow", high = "red") +
+  labs(title = "Churn rate by payment method and contract",
+       x = "", y = "", fill = "Churn %")
+```
+
+**Interpretation:** The payment method has a clear link with churn (the chi-square p-value is tiny). Electronic check users churn the most, and the heatmap shows that this is true **within each contract type** as well, though the gap is largest for month-to-month contracts. Customers on automatic payment (bank transfer or credit card) churn the least, maybe because automatic payment makes leaving less "visible" or the customer is more committed. Paperless billing also shows a higher churn rate.
+
+# 6. Q4: Family situation and age
+
+```{r family}
+# Simple tables
+d %>% group_by(Senior.Citizen) %>%
+  summarise(Customers = n(), Churn.Rate = round(100 * mean(Churn == "Yes"), 1))
+
+d %>% group_by(Partner) %>%
+  summarise(Customers = n(), Churn.Rate = round(100 * mean(Churn == "Yes"), 1))
+
+d %>% group_by(Dependents) %>%
+  summarise(Customers = n(), Churn.Rate = round(100 * mean(Churn == "Yes"), 1))
+```
+
+We combine the three variables to see which type of customer is most at risk.
+
+```{r family-heatmap}
+fam <- d %>% group_by(Senior.Citizen, Partner, Dependents) %>%
+  summarise(Customers = n(),
+            Churn.Rate = round(100 * mean(Churn == "Yes"), 1),
+            .groups = "drop")
+fam$Profile <- paste0("Partner: ", fam$Partner, " | Dependents: ", fam$Dependents)
+fam
+
+ggplot(fam, aes(x = Senior.Citizen, y = Profile, fill = Churn.Rate)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = paste0(Churn.Rate, "%\n(n=", Customers, ")"))) +
+  scale_fill_gradient(low = "lightyellow", high = "red") +
+  labs(title = "Churn rate by customer profile",
+       x = "Senior citizen", y = "", fill = "Churn %")
+```
+
+Test for the three variables:
+
+```{r family-test}
+chisq.test(table(d$Senior.Citizen, d$Churn))
+chisq.test(table(d$Partner, d$Churn))
+chisq.test(table(d$Dependents, d$Churn))
+```
+
+**Interpretation:** Senior citizens churn clearly more (about 42% vs. 24%). Customers with dependents churn much less than those without. The highest-risk profile is a **senior without partner or dependents** (49% churn, n = 558). The lowest-risk profile is a **non-senior with both a partner and dependents** (only 3.9%). (One group, seniors with dependents but no partner, has only 11 customers, so we ignore it.) Gender is not a useful factor:
+
+```{r gender}
+chisq.test(table(d$Gender, d$Churn))
+```
+
+The p-value is large, so there is no evidence that gender is related to churn.
+
+# 7. Q5: Do churned customers pay more?
+
+First we compare the monthly charges of the two groups with a **violin + boxplot**, split by internet service type.
+
+```{r charges-plot}
+ggplot(d, aes(x = Internet.Service, y = Monthly.Charges, fill = Churn)) +
+  geom_violin(position = position_dodge(0.9), alpha = 0.5) +
+  geom_boxplot(position = position_dodge(0.9), width = 0.15, outlier.size = 0.5) +
+  labs(title = "Monthly charges by internet service and churn",
+       x = "Internet service", y = "Monthly charges ($)")
+```
+
+```{r charges-summary}
+d %>% group_by(Internet.Service, Churn) %>%
+  summarise(Customers = n(),
+            Mean = round(mean(Monthly.Charges), 1),
+            Median = round(median(Monthly.Charges), 1),
+            .groups = "drop")
+```
+
+Now we test whether the difference is real. The charges are not normally distributed, so we use the **Wilcoxon rank-sum test** (a non-parametric alternative to the t-test) for each internet type.
+
+```{r charges-test}
+for (type in c("DSL", "Fiber optic", "No")) {
+  sub <- d %>% filter(Internet.Service == type)
+  cat("\n---", type, "---\n")
+  print(wilcox.test(Monthly.Charges ~ Churn, data = sub))
+}
+```
+
+**Interpretation:** Overall, churners pay more per month ($74 vs. $61 on average). But the picture changes when we split by internet type: **inside** each internet type, churners actually pay slightly *less* than customers who stay (about $11 less for DSL, $6 less for fiber optic, and only $0.70 less for customers without internet). The Wilcoxon tests are significant in all three groups, although for "No internet" the difference is too small to matter in practice. The overall gap exists because **fiber optic customers pay much more and also churn much more**. So the monthly price level by itself does not explain churn; the type of product (fiber optic) does.
+
+We can look at the churn rate by internet service directly:
+
+```{r internet-rate}
+d %>% group_by(Internet.Service) %>%
+  summarise(Customers = n(), Churn.Rate = round(100 * mean(Churn == "Yes"), 1))
+```
+
+# 8. Q6: Does churn depend on the location?
+
+All customers are in California. We check the churn rate for the biggest cities (at least 50 customers, so the percentages are reliable).
+
+```{r city}
+city <- d %>% group_by(City) %>%
+  summarise(Customers = n(), Churn.Rate = round(100 * mean(Churn == "Yes"), 1)) %>%
+  filter(Customers >= 50) %>%
+  arrange(desc(Churn.Rate))
+city
+```
+
+```{r city-plot}
+ggplot(city, aes(x = reorder(City, Churn.Rate), y = Churn.Rate)) +
+  geom_col(fill = "steelblue") +
+  geom_hline(yintercept = 100 * mean(d$Churn == "Yes"), linetype = "dashed", color = "red") +
+  coord_flip() +
+  labs(title = "Churn rate in cities with 50+ customers",
+       subtitle = "Dashed line = overall churn rate",
+       x = "", y = "Churn rate (%)")
+```
+
+```{r city-test}
+big <- d %>% filter(City %in% city$City)
+chisq.test(table(big$City, big$Churn))
+```
+
+We also plot all customers on a map-like scatter plot using latitude and longitude.
+
+```{r map}
+ggplot(d, aes(x = Longitude, y = Latitude, color = Churn)) +
+  geom_point(alpha = 0.5, size = 1) +
+  scale_color_manual(values = c("No" = "grey70", "Yes" = "red")) +
+  labs(title = "Customers in California (churned in red)",
+       x = "Longitude", y = "Latitude")
+```
+
+**Interpretation:** The churn rate varies a little between cities (from 24% to 33%), but the chi-square test gives a large p-value (about 0.73), so these differences are no larger than we would expect by chance. The map shows that customers are concentrated around Los Angeles, San Diego and the Bay Area, and the churners (red) are spread across all of these areas without a clear regional cluster. We conclude that location is probably **not** a main driver of churn compared with contract, services or billing.
+
+# 9. Q7: What is lost when customers churn?
+
+The dataset contains `CLTV` (customer lifetime value, estimated by IBM) and `Monthly.Charges`.
+
+```{r cltv}
+d %>% group_by(Churn) %>%
+  summarise(Customers = n(),
+            Mean.CLTV = round(mean(CLTV)),
+            Median.CLTV = round(median(CLTV)),
+            Mean.Monthly = round(mean(Monthly.Charges), 1),
+            Total.Monthly = round(sum(Monthly.Charges)))
+```
+
+```{r cltv-plot}
+ggplot(d, aes(x = Churn, y = CLTV, fill = Churn)) +
+  geom_boxplot() +
+  labs(title = "Customer lifetime value (CLTV) by churn", x = "Churned?", y = "CLTV")
+
+wilcox.test(CLTV ~ Churn, data = d)
+```
+
+```{r revenue}
+lost <- sum(d$Monthly.Charges[d$Churn == "Yes"])
+total <- sum(d$Monthly.Charges)
+cat("Monthly revenue lost to churn: $", round(lost), "\n")
+cat("Share of total monthly revenue:", round(100 * lost / total, 1), "%\n")
+cat("Total CLTV of churned customers: $", round(sum(d$CLTV[d$Churn == "Yes"])), "\n")
+```
+
+We also check whether the revenue lost is concentrated in some contract types:
+
+```{r revenue-contract}
+d %>% filter(Churn == "Yes") %>%
+  group_by(Contract) %>%
+  summarise(Customers = n(), Lost.Monthly.Revenue = round(sum(Monthly.Charges))) %>%
+  mutate(Percent = round(100 * Lost.Monthly.Revenue / sum(Lost.Monthly.Revenue), 1))
+```
+
+**Interpretation:** Churned customers have a lower CLTV on average (about $4,150 vs. $4,490), and the difference is significant, but their monthly charges are higher ($74 vs. $61). Because churners pay more per month than average, the share of monthly **revenue** lost (30.5%) is bigger than the share of **customers** lost (26.5%). About 87% of the lost monthly revenue comes from month-to-month contracts.
+
+**A note about `Churn.Score`:** this column is an IBM prediction score for churn. It is strongly correlated with the real outcome:
+
+```{r score}
+cor(d$Churn.Score, d$Churn.Value)
+```
+
+Because it was already calculated by IBM's own model and is so closely tied to the outcome, we **do not use** it (or `Churn.Reason`) as a predictor in Q8. Doing so would be data leakage.
+
+# 10. Q8: Combined view with logistic regression
+
+The earlier questions looked at one factor at a time, but factors are related (for example fiber optic customers are more likely to be on month-to-month contracts). A **logistic regression** looks at them together.
+
+```{r logit}
+# We use customers with internet service only, because Tech Support and Online
+# Security do not exist for customers without internet
+net$Tenure.Years <- net$Tenure.Months / 12
+
+model <- glm(Churn ~ Contract + Tenure.Years + Monthly.Charges +
+               Internet.Service + Tech.Support + Online.Security +
+               Payment.Method + Senior.Citizen + Dependents,
+             data = net, family = binomial)
+
+summary(model)
+```
+
+The coefficients are hard to read, so we convert them to **odds ratios** (values above 1 raise the chance of churn; below 1 lower it). We left out the number of services because it overlaps with Tech Support and Online Security.
+
+```{r odds}
+odds <- data.frame(Variable = names(coef(model)),
+                   Odds.Ratio = round(exp(coef(model)), 2))
+odds <- odds[odds$Variable != "(Intercept)", ]
+odds <- odds[order(-odds$Odds.Ratio), ]
+odds
+```
+
+```{r odds-plot, fig.height=6}
+ggplot(odds, aes(x = reorder(Variable, Odds.Ratio), y = Odds.Ratio)) +
+  geom_col(fill = "grey40") +
+  geom_hline(yintercept = 1, color = "red") +
+  coord_flip() +
+  labs(title = "Odds ratios from the logistic regression",
+       subtitle = "Above the red line = higher churn risk",
+       x = "", y = "Odds ratio")
+```
+
+A quick check of how well the model fits (accuracy on the same data; we do not claim this is a final prediction model):
+
+```{r accuracy}
+pred <- ifelse(predict(model, type = "response") > 0.5, "Yes", "No")
+table(Predicted = pred, Actual = net$Churn)
+cat("Model accuracy:", round(mean(pred == net$Churn), 3), "\n")
+cat("Accuracy of always guessing 'No':", round(mean(net$Churn == "No"), 3), "\n")
+```
+
+**Interpretation:** After controlling for the other factors, the strongest links with *lower* churn are having **dependents** (odds ratio 0.22), a **two-year contract** (0.30) and a **one-year contract** (0.55). Every extra year of tenure lowers the odds by about 30%, and **Online Security** and **Tech Support** each lower them by about 35-40%. Fiber optic internet (1.64) and electronic check payment (1.49) raise the odds of churn. Being a senior is only borderline significant once the other variables are included (p = 0.054), and credit card or mailed check payment is no different from bank transfer. This shows that some effects seen earlier (such as seniors) were partly explained by other variables. Monthly charges have an odds ratio of about 1.01 per dollar, which is a small effect: it is about 1.1 for every extra $10. The model classifies about 77% of the internet customers correctly, which is better than the 68% we would get by always guessing "No".
+
+# 11. Summary of main findings
+
+1. **About 1 in 4 customers churned (26.5%).**
+2. **Reasons:** The main reasons given are competitors (better offers, devices, speed) and the attitude of staff. Both are controllable by the company.
+3. **Protective services:** churn falls from 52% (no add-ons) to 5% (all six add-ons). Online Security and Tech Support show the biggest gap (about 26-27 points); streaming services only show about 3-4 points.
+4. **Billing:** Electronic check payers and paperless billing customers churn more, also within the same contract type.
+5. **Customer profile:** Seniors and customers without partner or dependents are more likely to leave. Gender does not matter.
+6. **Price and product:** Churners pay more overall ($74 vs. $61) only because fiber optic customers pay more and churn more (42% vs. 19% for DSL). Within the same internet type, churners do not pay more.
+7. **Location:** Churn is spread over California without a clear regional pattern; differences between the larger cities are not significant (p = 0.73).
+8. **Business impact:** Churners represent 30.5% of monthly revenue (vs. 26.5% of customers), and about 87% of the lost revenue comes from month-to-month contracts.
+9. **Combined model:** Dependents, contract length, tenure, fiber optic internet, electronic check payment, and Online Security / Tech Support are the most important factors when considered together.
+
+## Implications
+
+* Encourage month-to-month customers to move to longer contracts (discounts, bundles), especially in the first months.
+* Promote tech support and online security, for example as a free trial for new customers.
+* Review the fiber optic offer (price vs. speed) and the staff service quality.
+* Offer incentives for automatic payment instead of electronic check.
+* Pay special attention to senior customers living alone.
+
+## New questions
+
+* Would a customer who contacts tech support in the first months be more likely to stay? (We have no support-contact data.)
+* Why does fiber optic churn more: price, quality, or competitors in the area?
+* Does the effect of services change over time (tenure)?
+* A better prediction model should be tested on a separate test set (train/test split) instead of the same data.
+
+## Limitations
+
+* The data is observational, so we can find associations but not prove causes.
+* Some groups (for example churners with long contracts) are small.
+* The churn reasons are self-reported and 154 customers answered "Don't know".
